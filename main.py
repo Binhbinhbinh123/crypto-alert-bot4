@@ -1,30 +1,127 @@
-import telebot
+# main.py
+import requests
+import time
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import mplfinance as mpf
+from datetime import datetime
 
-# --- Thông tin của bạn (đã điền sẵn) ---
-BOT_TOKEN = "6998091887:AAGSOlC-XXXXXXXXXXXXXXXXXXXXXXX"
-CHANNEL_ID = -1002123456789  # Thay bằng ID thật của bạn nếu khác
+# ======================== CONFIG ==========================
+BOT_TOKEN = "7264977373:AAEZcqW5XL2LqLoQKbLUOKW1N0pdiGE2kFs"
+CHAT_ID = "510189896"  # Đây là chat ID thật của bạn
+COINS = [
+    "BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX", "LINK", "TRX",
+    "DOT", "MATIC", "SHIB", "LTC", "TON", "APT", "BCH", "NEAR", "ARB", "OP",
+    "UNI", "XLM", "INJ", "SUI", "AAVE", "ETC", "RUNE", "SEI", "RNDR", "GRT"
+]
+TIMEFRAMES = ["h1", "h4", "d"]
+INTERVAL_SECONDS = 900  # 15 phút
+# ==========================================================
 
-# --- Khởi tạo bot ---
-bot = telebot.TeleBot(BOT_TOKEN)
 
-# --- Xử lý lệnh /start ---
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    bot.reply_to(message, "🤖 Bot Telegram cảnh báo AI đã hoạt động thành công trên Render!")
+def fetch_ohlcv(coin, timeframe):
+    url = f"https://min-api.cryptocompare.com/data/v2/histo{timeframe}?fsym={coin}&tsym=USDT&limit=100"
+    r = requests.get(url)
+    data = r.json()["Data"]["Data"]
+    df = pd.DataFrame(data)
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    df.set_index("time", inplace=True)
+    df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volumeto": "Volume"}, inplace=True)
+    return df[["Open", "High", "Low", "Close", "Volume"]]
 
-# --- Phản hồi mọi tin nhắn ---
-@bot.message_handler(func=lambda message: True)
-def echo_all(message):
-    bot.reply_to(message, f"Bạn vừa gửi: {message.text}")
 
-# --- Hàm gửi cảnh báo đến kênh ---
-def send_channel_alert(text):
-    try:
-        bot.send_message(CHANNEL_ID, text)
-    except Exception as e:
-        print(f"Lỗi khi gửi tin nhắn: {e}")
+def calculate_indicators(df):
+    # RSI
+    delta = df["Close"].diff()
+    gain = np.where(delta > 0, delta, 0)
+    loss = np.where(delta < 0, -delta, 0)
+    avg_gain = pd.Series(gain).rolling(window=14).mean()
+    avg_loss = pd.Series(loss).rolling(window=14).mean()
+    rs = avg_gain / avg_loss
+    df["RSI"] = 100 - (100 / (1 + rs))
 
-# --- Điểm bắt đầu bot ---
-if __name__ == '__main__':
-    print("🚀 Bot đang chạy polling...")
-    bot.polling(non_stop=True)
+    # MACD
+    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = ema12 - ema26
+    df["Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    return df
+
+
+def detect_wedge(df):
+    highs = df["High"][-5:]
+    lows = df["Low"][-5:]
+    slope_high = np.polyfit(range(5), highs, 1)[0]
+    slope_low = np.polyfit(range(5), lows, 1)[0]
+
+    if slope_high < 0 and slope_low > 0:
+        if df["Close"].iloc[-1] > highs.max():
+            return "Breakout tăng"
+        elif df["Close"].iloc[-1] < lows.min():
+            return "Breakout giảm"
+    return None
+
+
+def draw_chart(df, coin, timeframe, note):
+    filename = f"chart_{coin}_{timeframe}.png"
+    mpf.plot(df[-50:], type='candle', style='charles', title=f"{coin} {timeframe.upper()} - {note}",
+             ylabel='Price', savefig=filename)
+    return filename
+
+
+def send_alert(coin, timeframe, signal, image_path):
+    text = f"🚨 {coin}/{timeframe.upper()} phát hiện tín hiệu: {signal}"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    with open(image_path, "rb") as photo:
+        requests.post(url, data={"chat_id": CHAT_ID, "caption": text}, files={"photo": photo})
+
+
+def run():
+    for coin in COINS:
+        for tf in TIMEFRAMES:
+            try:
+                df = fetch_ohlcv(coin, tf)
+                df = calculate_indicators(df)
+                wedge_signal = detect_wedge(df)
+
+                rsi = df["RSI"].iloc[-1]
+                macd = df["MACD"].iloc[-1]
+                signal = df["Signal"].iloc[-1]
+
+                rsi_note = ""
+                if rsi < 20:
+                    rsi_note = "RSI quá bán"
+                elif rsi > 80:
+                    rsi_note = "RSI quá mua"
+
+                macd_note = ""
+                if macd > signal:
+                    macd_note = "MACD vàng (tăng)"
+                elif macd < signal:
+                    macd_note = "MACD chết (giảm)"
+
+                notes = []
+                if wedge_signal:
+                    notes.append(wedge_signal)
+                if rsi_note:
+                    notes.append(rsi_note)
+                if macd_note:
+                    notes.append(macd_note)
+
+                if notes:
+                    chart = draw_chart(df, coin, tf, ", ".join(notes))
+                    send_alert(coin, tf, ", ".join(notes), chart)
+                    print(f"[+] Alert sent for {coin} {tf}: {notes}")
+                else:
+                    print(f"[-] No signal for {coin} {tf}")
+
+            except Exception as e:
+                print(f"[!] Error with {coin} {tf}: {e}")
+
+
+if __name__ == "__main__":
+    while True:
+        print(f"[~] Đang kiểm tra tín hiệu lúc {datetime.now()}")
+        run()
+        time.sleep(INTERVAL_SECONDS)
